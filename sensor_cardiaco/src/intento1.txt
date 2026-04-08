@@ -1,0 +1,172 @@
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include "AsyncTaskLib.h"
+#include "StateMachineLib.h"
+#include "esp_sleep.h"
+
+MAX30105 particleSensor;
+
+// ---------------- BPM ----------------
+const byte RATE_SIZE = 16;
+byte rates[RATE_SIZE];
+byte rateSpot = 0;
+long lastBeat = 0;
+
+float beatsPerMinute;
+int beatAvg;
+long irValue;
+
+// ---------------- ESTADOS ----------------
+enum State {
+  INIT = 0,
+  STABILIZING,
+  MONITORING,
+  SLEEPING
+};
+
+StateMachine stateMachine(4, 4);
+State currentState;
+
+// ---------------- TIMERS ----------------
+AsyncTask TaskReadSensor(50, true, readSensor);
+AsyncTask TaskReport(1500, true, reportData);
+AsyncTask TaskStabilizationTimer(10000, false, stabilizationDone);
+AsyncTask TaskMonitoringTimer(9000, false, monitoringDone);
+
+// ---------------- FLAGS ----------------
+bool fingerDetected = false;
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(115200);
+
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("Sensor MAX30105 no encontrado");
+    while (1);
+  }
+
+  particleSensor.setup();
+  particleSensor.setPulseAmplitudeRed(0x0A);
+  particleSensor.setPulseAmplitudeGreen(0);
+
+  setupStateMachine();
+  stateMachine.SetState(INIT, false, true);
+}
+
+// ---------------- LOOP ----------------
+void loop() {
+  TaskReadSensor.Update();
+  TaskReport.Update();
+  TaskStabilizationTimer.Update();
+  TaskMonitoringTimer.Update();
+
+  stateMachine.Update();
+}
+
+// ---------------- STATE MACHINE ----------------
+void setupStateMachine() {
+
+  stateMachine.AddTransition(INIT, STABILIZING, []() { return true; });
+
+  stateMachine.AddTransition(STABILIZING, MONITORING, []() {
+    return TaskStabilizationTimer.IsFinished();
+  });
+
+  stateMachine.AddTransition(MONITORING, SLEEPING, []() {
+    return TaskMonitoringTimer.IsFinished();
+  });
+
+  // -------- ENTER STATES --------
+  stateMachine.SetOnEntering(INIT, onInit);
+  stateMachine.SetOnEntering(STABILIZING, onStabilizing);
+  stateMachine.SetOnEntering(MONITORING, onMonitoring);
+  stateMachine.SetOnEntering(SLEEPING, onSleeping);
+}
+
+// ---------------- ESTADOS ----------------
+void onInit() {
+  Serial.println("Estado: INIT");
+}
+
+void onStabilizing() {
+  Serial.println("Estado: STABILIZANDO (NO mostrar datos)");
+
+  currentState = STABILIZING;
+
+  TaskReadSensor.Start();
+  TaskReport.Stop();
+
+  TaskStabilizationTimer.Start();
+}
+
+void onMonitoring() {
+  Serial.println("Estado: MONITOREO (MOSTRAR datos)");
+
+  currentState = MONITORING;
+
+  TaskReport.Start();
+  TaskMonitoringTimer.Start();
+}
+
+void onSleeping() {
+  Serial.println("Estado: SLEEPING (Deep Sleep 60s)");
+
+  TaskReadSensor.Stop();
+  TaskReport.Stop();
+
+  delay(100);
+
+  esp_sleep_enable_timer_wakeup(60 * 1000000);
+  esp_deep_sleep_start();
+}
+
+// ---------------- FUNCIONES ----------------
+void readSensor() {
+
+  irValue = particleSensor.getIR();
+
+  if (checkForBeat(irValue)) {
+    long delta = millis() - lastBeat;
+    lastBeat = millis();
+
+    beatsPerMinute = 60 / (delta / 1000.0);
+
+    if (beatsPerMinute > 20 && beatsPerMinute < 255) {
+
+      rates[rateSpot++] = (byte)beatsPerMinute;
+      rateSpot %= RATE_SIZE;
+
+      beatAvg = 0;
+      for (byte i = 0; i < RATE_SIZE; i++)
+        beatAvg += rates[i];
+
+      beatAvg /= RATE_SIZE;
+    }
+  }
+
+  fingerDetected = (irValue > 50000);
+}
+
+void reportData() {
+
+  if (!fingerDetected) {
+    Serial.println("No se detecta dedo");
+    return;
+  }
+
+  Serial.print("BPM: ");
+  Serial.print(beatsPerMinute);
+
+  Serial.print(" | Promedio: ");
+  Serial.println(beatAvg);
+}
+
+// ---------------- CALLBACKS ----------------
+void stabilizationDone() {
+  // Solo trigger lógico
+}
+
+void monitoringDone() {
+  // Solo trigger lógico
+}

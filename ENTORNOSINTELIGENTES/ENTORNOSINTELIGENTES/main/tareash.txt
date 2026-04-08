@@ -1,0 +1,224 @@
+/**
+ * @file tareas.h
+ * @brief Declaraciones, tipos y constantes del sistema de monitoreo biomédico.
+ *
+ * Hardware final:
+ *   MAX30100  → SDA=GPIO15, SCL=GPIO16  → I2C_NUM_0  (ritmo cardíaco + SpO2)
+ *   MLX90614  → SDA=GPIO18, SCL=GPIO17  → I2C_NUM_1  (temperatura IR)
+ *   LED       → GPIO21
+ *   BOTÓN     → GPIO33
+ */
+
+#ifndef TAREAS_H
+#define TAREAS_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include "esp_err.h"
+#include "driver/i2c.h"
+
+/* =========================================================================
+ * CONSTANTES DE HARDWARE — BUS I2C PARA MAX30100
+ * El MAX30100 es el sensor de ritmo cardíaco/SpO2.
+ * Usa I2C_NUM_0 con SDA en GPIO15 y SCL en GPIO16.
+ * ========================================================================= */
+#define I2C_PUERTO_MAX30100         I2C_NUM_0
+#define I2C_GPIO_SDA_MAX30100       15
+#define I2C_GPIO_SCL_MAX30100       16
+#define I2C_FRECUENCIA_MAX30100_HZ  100000
+
+/* =========================================================================
+ * CONSTANTES DE HARDWARE — BUS I2C PARA MLX90614
+ * El MLX90614 es el sensor de temperatura infrarroja.
+ * Usa I2C_NUM_1 con SDA en GPIO18 y SCL en GPIO17.
+ * ========================================================================= */
+#define I2C_PUERTO_MLX90614         I2C_NUM_1
+#define I2C_GPIO_SDA_MLX90614       18
+#define I2C_GPIO_SCL_MLX90614       17
+#define I2C_FRECUENCIA_MLX90614_HZ  100000
+
+/* =========================================================================
+ * CONSTANTES DE HARDWARE — LED Y BOTÓN
+ * ========================================================================= */
+#define LED_GPIO                    21   /* Salida digital */
+#define BOTON_GPIO                  33   /* Entrada con pull-up interno */
+
+/* =========================================================================
+ * CONSTANTES DEL SENSOR MLX90614 (GY-906) — I2C_NUM_1
+ * ========================================================================= */
+
+/** Dirección I2C por defecto del MLX90614 */
+#define MLX90614_DIRECCION_I2C      0x5A
+
+/** Registro de temperatura del objeto (lo que apunta el sensor) */
+#define MLX90614_REG_TOBJ           0x07
+
+/** Registro de temperatura ambiente (temperatura del chip del sensor) */
+#define MLX90614_REG_TAMB           0x06
+
+/** Timeout para operaciones I2C en ms */
+#define I2C_TIMEOUT_MS              100
+
+/* =========================================================================
+ * CONSTANTES DEL SENSOR MAX30100 — I2C_NUM_0
+ * ========================================================================= */
+
+/** Dirección I2C del MAX30100 */
+#define MAX30100_DIRECCION_I2C      0x57
+
+/** Tasa de muestreo configurada en el MAX30100 (muestras por segundo) */
+#define MAX30100_SAMPLE_RATE_HZ     100
+
+/**
+ * Tamaño del buffer de muestras del MAX30100.
+ * A 100 Hz durante 2 segundos = 200 muestras en modo normal.
+ * En modo alerta = 400 muestras (4 segundos equivalente de datos).
+ * Se define el máximo para que el buffer estático pueda usarse en ambos modos.
+ */
+#define MAX30100_BUFFER_SIZE        400
+
+/* =========================================================================
+ * CONSTANTES DE TIEMPO Y MUESTREO
+ * ========================================================================= */
+
+/** Duración de la ventana de monitoreo en ms (2 segundos) */
+#define VENTANA_MONITOREO_MS        2000
+
+/**
+ * Número de muestras del MAX30100 en modo normal.
+ * A 100 Hz × 2 s = 200 muestras. Mínimo recomendado para detect_peaks_bpm.
+ */
+#define MUESTRAS_MAX30100_NORMAL    200
+
+/**
+ * Número de muestras del MAX30100 en modo alerta (más muestras = más precisión).
+ * A 100 Hz × 4 s = 400 muestras.
+ */
+#define MUESTRAS_MAX30100_ALERTA    400
+
+/** Número de muestras de temperatura en modo normal */
+#define MUESTRAS_TEMP_NORMAL        10
+
+/** Número de muestras de temperatura en modo alerta */
+#define MUESTRAS_TEMP_ALERTA        20
+
+/** Delay entre muestras de temperatura en ms */
+#define DELAY_MUESTRAS_TEMP_MS      200
+
+/** Delay entre muestras del MAX30100 en ms (10 ms = 100 Hz) */
+#define DELAY_MUESTRAS_MAX30100_MS  10
+
+/* =========================================================================
+ * CONSTANTES DE ALERTAS Y UMBRALES BIOMÉDICOS
+ * ========================================================================= */
+
+/** Temperatura de objeto a partir de la cual se activa alerta amarilla (°C) */
+#define UMBRAL_TEMP_ALERTA_CELSIUS  36.0f
+
+/** BPM mínimo considerado normal */
+#define UMBRAL_BPM_MINIMO           55
+
+/** BPM máximo considerado normal */
+#define UMBRAL_BPM_MAXIMO           75
+
+/** Alertas amarillas acumuladas que indican posible crisis */
+#define MAX_ALERTAS_AMARILLAS       5
+
+/** Alertas rojas acumuladas que indican posible crisis */
+#define MAX_ALERTAS_ROJAS           3
+
+/* =========================================================================
+ * ENUMERACIÓN: ESTADOS DE LA MÁQUINA DE ESTADOS
+ * ========================================================================= */
+
+/**
+ * @brief Define los tres estados del sistema de monitoreo.
+ *
+ * ESTADO_INICIO              → El sistema espera que se presione el botón.
+ * ESTADO_MONITOREO_RITMO     → Se mide ritmo cardíaco con el MAX30100.
+ * ESTADO_MONITOREO_TEMPERATURA → Se mide temperatura con el MLX90614.
+ */
+typedef enum {
+    ESTADO_INICIO = 0,
+    ESTADO_MONITOREO_RITMO,
+    ESTADO_MONITOREO_TEMPERATURA
+} EstadoSistema_t;
+
+/* =========================================================================
+ * ESTRUCTURA: MUESTRA DEL MAX30100
+ * Contiene los dos canales de luz del sensor: IR y rojo.
+ * ========================================================================= */
+typedef struct {
+    uint16_t ir;   /**< Canal infrarrojo (principal para BPM) */
+    uint16_t red;  /**< Canal rojo (usado para SpO2) */
+} MuestraMax30100_t;
+
+/* =========================================================================
+ * ESTRUCTURA: RESULTADO DE MONITOREO DE RITMO CARDÍACO
+ * ========================================================================= */
+typedef struct {
+    int      bpm_calculado;       /**< BPM detectado (-1 si inválido) */
+    float    spo2_estimada;       /**< SpO2 estimada en % (-1 si inválida) */
+    float    ir_promedio;         /**< Promedio del canal IR (indica contacto) */
+    int      calidad_senal;       /**< Calidad de señal 0–100 */
+    bool     contacto_detectado;  /**< true si hay dedo apoyado correctamente */
+    bool     resultado_valido;    /**< true si BPM y SpO2 son confiables */
+    bool     alerta_activa;       /**< true si se activó alerta roja */
+    char     estado_texto[64];    /**< Descripción textual del estado */
+} ResultadoRitmo_t;
+
+/* =========================================================================
+ * ESTRUCTURA: RESULTADO DE MONITOREO DE TEMPERATURA
+ * ========================================================================= */
+typedef struct {
+    float    temp_objeto_celsius;    /**< Temperatura promedio del objeto (°C) */
+    float    temp_ambiente_celsius;  /**< Temperatura ambiente del sensor (°C) */
+    uint32_t total_muestras;         /**< Muestras tomadas en la ventana */
+    bool     alerta_activa;          /**< true si se activó alerta amarilla */
+} ResultadoTemperatura_t;
+
+/* =========================================================================
+ * ESTRUCTURA: CONTEXTO GLOBAL DEL SISTEMA
+ * Agrupa los contadores de alertas y los últimos resultados de cada sensor.
+ * ========================================================================= */
+typedef struct {
+    uint32_t               contador_alertas_amarillas; /**< Alertas amarillas acumuladas */
+    uint32_t               contador_alertas_rojas;     /**< Alertas rojas acumuladas */
+    ResultadoRitmo_t       ultimo_ritmo;               /**< Último resultado de BPM/SpO2 */
+    ResultadoTemperatura_t ultima_temperatura;         /**< Último resultado de temperatura */
+} ContextoSistema_t;
+
+/* =========================================================================
+ * PROTOTIPOS DE FUNCIONES PÚBLICAS
+ * ========================================================================= */
+
+/* --- Inicialización de hardware --- */
+esp_err_t i2c_inicializar_max30100(void);
+esp_err_t i2c_inicializar_mlx90614(void);
+esp_err_t max30100_inicializar(void);
+void      led_inicializar(void);
+void      boton_inicializar(void);
+
+/* --- Control del LED --- */
+void led_encender(void);
+void led_apagar(void);
+
+/* --- Lectura del botón --- */
+bool boton_esta_presionado(void);
+
+/* --- Sensor MLX90614 --- */
+esp_err_t mlx90614_leer_temperatura(uint8_t registro, float *temperatura_celsius);
+
+/* --- Sensor MAX30100 --- */
+esp_err_t max30100_leer_muestra(MuestraMax30100_t *muestra);
+
+/* --- Tareas de monitoreo --- */
+void tarea_monitorear_ritmo(bool modo_alerta, ResultadoRitmo_t *resultado);
+void tarea_monitorear_temperatura(bool modo_alerta, ResultadoTemperatura_t *resultado);
+
+/* --- Lógica de alertas --- */
+bool evaluar_alerta_roja(const ResultadoRitmo_t *resultado, ContextoSistema_t *ctx);
+bool evaluar_alerta_amarilla(const ResultadoTemperatura_t *resultado, ContextoSistema_t *ctx);
+bool verificar_posible_crisis(const ContextoSistema_t *ctx);
+
+#endif /* TAREAS_H */

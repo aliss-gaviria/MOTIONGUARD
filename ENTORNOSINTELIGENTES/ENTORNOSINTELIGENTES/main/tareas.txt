@@ -1,0 +1,929 @@
+/**
+ * @file tareas.c
+ * @brief Implementación del sistema de monitoreo biomédico con MAX30100 y MLX90614.
+ *
+ * Este archivo implementa:
+ *  - Inicialización de DOS buses I2C independientes:
+ *      I2C_NUM_0 → MAX30100 (GPIO15=SDA, GPIO16=SCL)
+ *      I2C_NUM_1 → MLX90614 (GPIO18=SDA, GPIO17=SCL)
+ *  - Lectura del MAX30100: adquisición de muestras IR y rojo
+ *  - Cálculo de BPM mediante detección de picos con umbral adaptativo
+ *  - Estimación de SpO2 mediante ratio de ratios AC/DC
+ *  - Lectura del MLX90614: temperatura de objeto y ambiente
+ *  - Control del LED (GPIO21) y botón (GPIO33)
+ *  - Lógica de alertas roja, amarilla y posible crisis de ansiedad
+ *
+ * NOTA SOBRE EL MAX30100:
+ *   El MAX30100 es un sensor óptico de pulso con dos LEDs (IR y rojo) y
+ *   un fotodetector. Mide la variación de luz absorbida por la sangre
+ *   (fotopletismografía). Es significativamente más preciso que el KY-039
+ *   porque tiene filtros analógicos internos, ganancia programable y
+ *   un ADC de 16 bits dedicado. Aun así, los valores de SpO2 calculados
+ *   aquí son ESTIMACIONES DIDÁCTICAS, no aptas para uso médico real.
+ */
+
+#include "tareas.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+
+#include "esp_log.h"
+#include "esp_err.h"
+#include "driver/i2c.h"
+#include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+/* =========================================================================
+ * TAG PARA LOGS DEL SISTEMA
+ * ========================================================================= */
+static const char *TAG_SISTEMA = "BIOMEDICO";
+
+/* =========================================================================
+ * REGISTROS INTERNOS DEL MAX30100
+ * Estos valores están definidos en el datasheet del MAX30100 (Maxim Integrated).
+ * ========================================================================= */
+#define MAX30100_REG_INT_STATUS         0x00  /* Estado de interrupciones */
+#define MAX30100_REG_INT_ENABLE         0x01  /* Habilitar interrupciones */
+#define MAX30100_REG_FIFO_WR_PTR        0x02  /* Puntero de escritura del FIFO */
+#define MAX30100_REG_OVF_COUNTER        0x03  /* Contador de overflow del FIFO */
+#define MAX30100_REG_FIFO_RD_PTR        0x04  /* Puntero de lectura del FIFO */
+#define MAX30100_REG_FIFO_DATA          0x05  /* Datos del FIFO (4 bytes por muestra) */
+#define MAX30100_REG_MODE_CONFIG        0x06  /* Configuración de modo de operación */
+#define MAX30100_REG_SPO2_CONFIG        0x07  /* Configuración de SpO2 */
+#define MAX30100_REG_LED_CONFIG         0x09  /* Corriente de los LEDs */
+#define MAX30100_REG_TEMP_INTEGER       0x16  /* Parte entera de temperatura del chip */
+#define MAX30100_REG_TEMP_FRACTION      0x17  /* Parte fraccionaria de temperatura */
+#define MAX30100_REG_PART_ID            0xFF  /* ID del chip (debe ser 0x11) */
+
+/* Configuración del modo SpO2 (mide IR y rojo simultáneamente) */
+#define MAX30100_MODE_SPO2              0x03
+
+/* Bit de reset por software */
+#define MAX30100_RESET_BIT              0x40
+
+/* SpO2 alta resolución habilitada */
+#define MAX30100_SPO2_HI_RES_EN         0x40
+
+/* Tasa de muestreo: 100 Hz (campo SR[2:0] = 100) */
+#define MAX30100_SR_100HZ               0x04
+
+/* Ancho de pulso LED: 1600 µs (máxima resolución, 16 bits) */
+#define MAX30100_LED_PW_1600US          0x03
+
+/* Corriente del LED: 27 mA (buen compromiso para lectura en dedo) */
+#define MAX30100_LED_CURR_27MA          0x0B
+
+/* =========================================================================
+ * FUNCIONES AUXILIARES PRIVADAS — MATEMÁTICAS Y PROCESAMIENTO
+ * Estas funciones son internas a este archivo (static = no visibles afuera).
+ * ========================================================================= */
+
+/**
+ * @brief Calcula la desviación estándar de un arreglo de floats.
+ * Se usa para evaluar si hay variación suficiente en la señal (señal viva).
+ */
+static float calcular_desviacion_estandar(const float *arreglo, int n, float media)
+{
+    double suma_cuadrados = 0.0;
+    for (int i = 0; i < n; i++) {
+        double diff = arreglo[i] - media;
+        suma_cuadrados += diff * diff;
+    }
+    return (float)sqrt(suma_cuadrados / n);
+}
+
+/**
+ * @brief Calcula la RMS (raíz cuadrada de la media de cuadrados) de un arreglo.
+ * Se usa para estimar la amplitud AC de la señal fotopletismográfica.
+ */
+static float calcular_rms(const float *arreglo, int n)
+{
+    double suma = 0.0;
+    for (int i = 0; i < n; i++) {
+        suma += (double)arreglo[i] * (double)arreglo[i];
+    }
+    return (float)sqrt(suma / n);
+}
+
+/**
+ * @brief Filtro IIR pasa-bajos simple.
+ * Suaviza la señal para reducir ruido de alta frecuencia.
+ * alpha cercano a 1 = más suavizado (más lento); cercano a 0 = menos suavizado.
+ *
+ * Fórmula: salida[i] = alpha * salida[i-1] + (1 - alpha) * entrada[i]
+ */
+static void filtro_pasabajos_iir(const float *entrada, float *salida, int n, float alpha)
+{
+    if (n <= 0) return;
+    salida[0] = entrada[0];
+    for (int i = 1; i < n; i++) {
+        salida[i] = alpha * salida[i - 1] + (1.0f - alpha) * entrada[i];
+    }
+}
+
+/**
+ * @brief Elimina la componente DC de la señal usando un filtro IIR lento.
+ * La componente DC es el nivel base de luz (sin pulsación).
+ * Lo que queda es la componente AC: la variación causada por cada latido.
+ *
+ * alpha_dc cercano a 1 = estimación DC muy lenta = mejor separación AC/DC.
+ */
+static void eliminar_componente_dc(const float *entrada, float *componente_ac,
+                                   int n, float alpha_dc)
+{
+    if (n <= 0) return;
+    float estimacion_dc = entrada[0];
+    for (int i = 0; i < n; i++) {
+        estimacion_dc = alpha_dc * estimacion_dc + (1.0f - alpha_dc) * entrada[i];
+        componente_ac[i] = entrada[i] - estimacion_dc;
+    }
+}
+
+/**
+ * @brief Detecta picos en la señal AC y calcula BPM.
+ *
+ * Algoritmo:
+ *  1. Calcula media y desviación estándar de la señal.
+ *  2. Si la SD es muy baja, la señal es plana (sin latidos) → retorna -1.
+ *  3. Umbral = media + 0.6 * SD (detecta picos significativos).
+ *  4. Un pico es un punto local máximo sobre el umbral, con período refractario
+ *     (tiempo mínimo entre picos, equivalente a ~250 ms para dedo).
+ *  5. BPM = (picos / segundos) × 60.
+ *
+ * @param senal_ac      Arreglo de señal AC filtrada
+ * @param n             Número de muestras
+ * @param fs            Frecuencia de muestreo en Hz
+ * @return BPM calculado, o -1 si la señal es inválida o BPM fuera de rango
+ */
+static int detectar_picos_y_calcular_bpm(const float *senal_ac, int n, float fs)
+{
+    /* Calcular media */
+    float media = 0.0f;
+    for (int i = 0; i < n; i++) media += senal_ac[i];
+    media /= n;
+
+    /* Calcular desviación estándar */
+    float sd = calcular_desviacion_estandar(senal_ac, n, media);
+
+    /* Si la señal es casi plana, no hay pulsación detectable */
+    if (sd < 1.0f) {
+        return -1;
+    }
+
+    /* Umbral adaptativo: media + 60% de la desviación estándar */
+    float umbral_adaptativo = media + 0.6f * sd;
+
+    /*
+     * Período refractario: tiempo mínimo entre dos picos consecutivos.
+     * A 60 BPM, un latido cada 1000 ms. A 100 Hz, eso es 100 muestras.
+     * Usamos 40 muestras = 400 ms (permite hasta 150 BPM, que es el límite alto razonable).
+     */
+    int periodo_refractario_muestras = (int)(0.40f * fs);
+
+    int total_picos_detectados = 0;
+    int indice_ultimo_pico     = -1000;  /* Inicializar lejos */
+
+    /*
+     * Detección de máximos locales:
+     * Un punto es pico si: está sobre el umbral, es mayor que sus dos vecinos
+     * anteriores y mayor o igual a sus dos vecinos siguientes.
+     * La ventana de ±2 muestras reduce falsas detecciones por ruido.
+     */
+    for (int i = 2; i < n - 2; i++) {
+        bool es_maximo_local =
+            senal_ac[i] > umbral_adaptativo  &&
+            senal_ac[i] > senal_ac[i - 1]    &&
+            senal_ac[i] > senal_ac[i - 2]    &&
+            senal_ac[i] >= senal_ac[i + 1]   &&
+            senal_ac[i] >= senal_ac[i + 2];
+
+        if (es_maximo_local) {
+            /* Verificar período refractario */
+            if ((i - indice_ultimo_pico) >= periodo_refractario_muestras) {
+                total_picos_detectados++;
+                indice_ultimo_pico = i;
+            }
+        }
+    }
+
+    /* Calcular BPM a partir del número de picos y el tiempo total */
+    float tiempo_total_segundos = (float)n / fs;
+    int bpm_resultado = (int)roundf(
+        ((float)total_picos_detectados * 60.0f) / tiempo_total_segundos
+    );
+
+    /* Validar rango fisiológico razonable */
+    if (bpm_resultado < 40 || bpm_resultado > 200) {
+        return -1;
+    }
+
+    return bpm_resultado;
+}
+
+/**
+ * @brief Estima la calidad de señal del MAX30100 en un score de 0 a 100.
+ *
+ * Evalúa:
+ *  - Si el promedio IR es suficientemente alto (indica dedo presente)
+ *  - Si la amplitud AC es suficiente (indica pulsación visible)
+ *
+ * @return Calidad entre 0 (sin señal) y 100 (señal excelente)
+ */
+static int estimar_calidad_senal_max30100(float ir_promedio, float ir_ac_rms,
+                                          float red_promedio, float red_ac_rms,
+                                          float ir_pico_a_pico)
+{
+    int calidad = 0;
+
+    /* Componente DC: indica que hay tejido sobre el sensor */
+    if (ir_promedio  > 12000.0f) calidad += 25;
+    if (red_promedio > 12000.0f) calidad += 15;
+
+    /* Componente AC: indica que hay pulsación */
+    if (ir_ac_rms  > 80.0f) calidad += 20;
+    if (red_ac_rms > 50.0f) calidad += 10;
+
+    /* Amplitud pico a pico del canal IR */
+    if (ir_pico_a_pico > 300.0f) calidad += 30;
+
+    /* Limitar entre 0 y 100 */
+    if (calidad < 0)   calidad = 0;
+    if (calidad > 100) calidad = 100;
+
+    return calidad;
+}
+
+/* =========================================================================
+ * FUNCIONES I2C INTERNAS DEL MAX30100
+ * ========================================================================= */
+
+/**
+ * @brief Escribe un byte en un registro del MAX30100 via I2C_NUM_0.
+ */
+static esp_err_t max30100_escribir_registro(uint8_t registro, uint8_t dato)
+{
+    uint8_t buffer_tx[2] = { registro, dato };
+    return i2c_master_write_to_device(
+        I2C_PUERTO_MAX30100,
+        MAX30100_DIRECCION_I2C,
+        buffer_tx,
+        sizeof(buffer_tx),
+        pdMS_TO_TICKS(I2C_TIMEOUT_MS)
+    );
+}
+
+/**
+ * @brief Lee N bytes desde un registro del MAX30100 via I2C_NUM_0.
+ */
+static esp_err_t max30100_leer_registro(uint8_t registro, uint8_t *datos, size_t longitud)
+{
+    return i2c_master_write_read_device(
+        I2C_PUERTO_MAX30100,
+        MAX30100_DIRECCION_I2C,
+        &registro,
+        1,
+        datos,
+        longitud,
+        pdMS_TO_TICKS(I2C_TIMEOUT_MS)
+    );
+}
+
+/* =========================================================================
+ * IMPLEMENTACIÓN: INICIALIZACIÓN DE LOS DOS BUSES I2C
+ * ========================================================================= */
+
+/**
+ * @brief Inicializa I2C_NUM_0 para el MAX30100 (GPIO15=SDA, GPIO16=SCL).
+ *
+ * Ambos sensores usan I2C pero en pines físicamente distintos.
+ * El ESP32-S3 tiene dos controladores I2C independientes (NUM_0 y NUM_1),
+ * cada uno puede asignarse a cualquier par de GPIOs.
+ */
+esp_err_t i2c_inicializar_max30100(void)
+{
+    i2c_config_t config_i2c_max30100 = {
+        .mode             = I2C_MODE_MASTER,
+        .sda_io_num       = I2C_GPIO_SDA_MAX30100,    /* GPIO15 */
+        .scl_io_num       = I2C_GPIO_SCL_MAX30100,    /* GPIO16 */
+        .sda_pullup_en    = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en    = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_FRECUENCIA_MAX30100_HZ,
+        .clk_flags        = 0
+    };
+
+    esp_err_t resultado = i2c_param_config(I2C_PUERTO_MAX30100, &config_i2c_max30100);
+    if (resultado != ESP_OK) {
+        ESP_LOGE(TAG_SISTEMA, "Error config I2C_NUM_0 (MAX30100): %s",
+                 esp_err_to_name(resultado));
+        return resultado;
+    }
+
+    resultado = i2c_driver_install(I2C_PUERTO_MAX30100, I2C_MODE_MASTER, 0, 0, 0);
+    /* ESP_ERR_INVALID_STATE significa que el driver ya estaba instalado, es aceptable */
+    if (resultado != ESP_OK && resultado != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG_SISTEMA, "Error instalando driver I2C_NUM_0: %s",
+                 esp_err_to_name(resultado));
+        return resultado;
+    }
+
+    ESP_LOGI(TAG_SISTEMA, "I2C_NUM_0 (MAX30100): SDA=GPIO%d, SCL=GPIO%d, %d Hz",
+             I2C_GPIO_SDA_MAX30100, I2C_GPIO_SCL_MAX30100, I2C_FRECUENCIA_MAX30100_HZ);
+    return ESP_OK;
+}
+
+/**
+ * @brief Inicializa I2C_NUM_1 para el MLX90614 (GPIO18=SDA, GPIO17=SCL).
+ */
+esp_err_t i2c_inicializar_mlx90614(void)
+{
+    i2c_config_t config_i2c_mlx = {
+        .mode             = I2C_MODE_MASTER,
+        .sda_io_num       = I2C_GPIO_SDA_MLX90614,    /* GPIO18 */
+        .scl_io_num       = I2C_GPIO_SCL_MLX90614,    /* GPIO17 */
+        .sda_pullup_en    = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en    = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_FRECUENCIA_MLX90614_HZ,
+        .clk_flags        = 0
+    };
+
+    esp_err_t resultado = i2c_param_config(I2C_PUERTO_MLX90614, &config_i2c_mlx);
+    if (resultado != ESP_OK) {
+        ESP_LOGE(TAG_SISTEMA, "Error config I2C_NUM_1 (MLX90614): %s",
+                 esp_err_to_name(resultado));
+        return resultado;
+    }
+
+    resultado = i2c_driver_install(I2C_PUERTO_MLX90614, I2C_MODE_MASTER, 0, 0, 0);
+    if (resultado != ESP_OK && resultado != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG_SISTEMA, "Error instalando driver I2C_NUM_1: %s",
+                 esp_err_to_name(resultado));
+        return resultado;
+    }
+
+    ESP_LOGI(TAG_SISTEMA, "I2C_NUM_1 (MLX90614): SDA=GPIO%d, SCL=GPIO%d, %d Hz",
+             I2C_GPIO_SDA_MLX90614, I2C_GPIO_SCL_MLX90614, I2C_FRECUENCIA_MLX90614_HZ);
+    return ESP_OK;
+}
+
+/* =========================================================================
+ * IMPLEMENTACIÓN: INICIALIZACIÓN DEL MAX30100
+ * ========================================================================= */
+
+/**
+ * @brief Inicializa y configura el MAX30100 para modo SpO2 a 100 Hz.
+ *
+ * Secuencia de inicialización:
+ *  1. Leer PART_ID para verificar comunicación (debe ser 0x11).
+ *  2. Reset por software (limpia todos los registros).
+ *  3. Limpiar punteros del FIFO.
+ *  4. Configurar modo SpO2 (IR + rojo simultáneo).
+ *  5. Configurar tasa de muestreo 100 Hz y ancho de pulso 1600 µs.
+ *  6. Configurar corriente de los LEDs a 27 mA.
+ */
+esp_err_t max30100_inicializar(void)
+{
+    /* Paso 1: Verificar PART_ID */
+    uint8_t part_id = 0;
+    esp_err_t resultado = max30100_leer_registro(MAX30100_REG_PART_ID, &part_id, 1);
+    if (resultado != ESP_OK) {
+        ESP_LOGE(TAG_SISTEMA, "MAX30100 no responde. Verificar conexiones GPIO15/16.");
+        return resultado;
+    }
+    ESP_LOGI(TAG_SISTEMA, "MAX30100 detectado. PART_ID=0x%02X (esperado: 0x11)", part_id);
+
+    /* Paso 2: Reset por software */
+    resultado = max30100_escribir_registro(MAX30100_REG_MODE_CONFIG, MAX30100_RESET_BIT);
+    if (resultado != ESP_OK) return resultado;
+    vTaskDelay(pdMS_TO_TICKS(100));  /* Esperar a que el reset termine */
+
+    /* Paso 3: Limpiar punteros del FIFO */
+    ESP_ERROR_CHECK(max30100_escribir_registro(MAX30100_REG_FIFO_WR_PTR, 0x00));
+    ESP_ERROR_CHECK(max30100_escribir_registro(MAX30100_REG_OVF_COUNTER, 0x00));
+    ESP_ERROR_CHECK(max30100_escribir_registro(MAX30100_REG_FIFO_RD_PTR, 0x00));
+
+    /* Paso 4: Modo SpO2 (mide IR y rojo) */
+    ESP_ERROR_CHECK(max30100_escribir_registro(MAX30100_REG_MODE_CONFIG,
+                                               MAX30100_MODE_SPO2));
+
+    /* Paso 5: SpO2 alta resolución, 100 Hz, ancho de pulso 1600 µs */
+    uint8_t config_spo2 = MAX30100_SPO2_HI_RES_EN |
+                          (MAX30100_SR_100HZ << 2)  |
+                          MAX30100_LED_PW_1600US;
+    ESP_ERROR_CHECK(max30100_escribir_registro(MAX30100_REG_SPO2_CONFIG, config_spo2));
+
+    /* Paso 6: Corriente de LEDs IR y rojo a 27 mA */
+    uint8_t config_leds = (MAX30100_LED_CURR_27MA << 4) | MAX30100_LED_CURR_27MA;
+    ESP_ERROR_CHECK(max30100_escribir_registro(MAX30100_REG_LED_CONFIG, config_leds));
+
+    /* Deshabilitar interrupciones (usamos polling) */
+    ESP_ERROR_CHECK(max30100_escribir_registro(MAX30100_REG_INT_ENABLE, 0x00));
+
+    ESP_LOGI(TAG_SISTEMA, "MAX30100 configurado: SPO2, 100Hz, 1600us, 27mA");
+    return ESP_OK;
+}
+
+/* =========================================================================
+ * IMPLEMENTACIÓN: LECTURA DE MUESTRA DEL MAX30100
+ * ========================================================================= */
+
+/**
+ * @brief Lee una muestra de 4 bytes del FIFO del MAX30100.
+ *
+ * El FIFO del MAX30100 almacena muestras de 4 bytes cada una:
+ *   Byte 0: IR [15:8]   (bits más significativos del canal IR)
+ *   Byte 1: IR [7:0]    (bits menos significativos del canal IR)
+ *   Byte 2: RED [15:8]  (bits más significativos del canal rojo)
+ *   Byte 3: RED [7:0]   (bits menos significativos del canal rojo)
+ *
+ * @param muestra  Puntero donde se guardarán los valores IR y rojo
+ * @return ESP_OK si la lectura fue exitosa
+ */
+esp_err_t max30100_leer_muestra(MuestraMax30100_t *muestra)
+{
+    if (muestra == NULL) return ESP_ERR_INVALID_ARG;
+
+    uint8_t buffer_rx[4];
+    esp_err_t resultado = max30100_leer_registro(MAX30100_REG_FIFO_DATA,
+                                                  buffer_rx, 4);
+    if (resultado != ESP_OK) return resultado;
+
+    /* Reconstruir valores de 16 bits desde los 4 bytes leídos */
+    muestra->ir  = ((uint16_t)buffer_rx[0] << 8) | buffer_rx[1];
+    muestra->red = ((uint16_t)buffer_rx[2] << 8) | buffer_rx[3];
+
+    return ESP_OK;
+}
+
+/* =========================================================================
+ * IMPLEMENTACIÓN: LED Y BOTÓN
+ * ========================================================================= */
+
+void led_inicializar(void)
+{
+    gpio_config_t config_led = {
+        .pin_bit_mask = (1ULL << LED_GPIO),  /* GPIO21 */
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE
+    };
+    gpio_config(&config_led);
+    gpio_set_level(LED_GPIO, 0);
+    ESP_LOGI(TAG_SISTEMA, "LED inicializado en GPIO%d", LED_GPIO);
+}
+
+/**
+ * @brief Inicializa el botón en GPIO33 como entrada con pull-up interno.
+ *
+ * Con pull-up: pin en HIGH cuando botón suelto, LOW cuando presionado.
+ * El GPIO33 en ESP32-S3 es un pin de uso general que soporta pull-up interno.
+ */
+void boton_inicializar(void)
+{
+    gpio_config_t config_boton = {
+        .pin_bit_mask = (1ULL << BOTON_GPIO),  /* GPIO33 */
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE
+    };
+    gpio_config(&config_boton);
+    ESP_LOGI(TAG_SISTEMA, "Botón inicializado en GPIO%d (pull-up activo)", BOTON_GPIO);
+}
+
+void led_encender(void) { gpio_set_level(LED_GPIO, 1); }
+void led_apagar(void)   { gpio_set_level(LED_GPIO, 0); }
+
+/**
+ * @brief Lee el botón con anti-rebote (debounce) de 20 ms por software.
+ * Primera detección de nivel LOW → esperar 20 ms → confirmar que sigue LOW.
+ */
+bool boton_esta_presionado(void)
+{
+    if (gpio_get_level(BOTON_GPIO) == 0) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        if (gpio_get_level(BOTON_GPIO) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* =========================================================================
+ * IMPLEMENTACIÓN: SENSOR MLX90614 — LECTURA I2C_NUM_1
+ * ========================================================================= */
+
+/**
+ * @brief Lee temperatura del MLX90614 mediante protocolo SMBus sobre I2C_NUM_1.
+ *
+ * Protocolo SMBus del MLX90614:
+ *   [START][ADDR+W][ACK][REG][ACK][RESTART][ADDR+R][ACK]
+ *   [BYTE_LO][ACK][BYTE_HI][ACK][PEC][NACK][STOP]
+ *
+ * Conversión: T(K) = raw * 0.02 → T(°C) = T(K) - 273.15
+ * El bit 15 del valor raw indica error si está en 1.
+ */
+esp_err_t mlx90614_leer_temperatura(uint8_t registro, float *temperatura_celsius)
+{
+    uint8_t buffer_rx[3];  /* 2 bytes de dato + 1 byte PEC (CRC de verificación) */
+
+    /* Construir transacción I2C manualmente (SMBus read word) */
+    i2c_cmd_handle_t handle_cmd = i2c_cmd_link_create();
+
+    /* Fase escritura: seleccionar registro */
+    i2c_master_start(handle_cmd);
+    i2c_master_write_byte(handle_cmd,
+                          (MLX90614_DIRECCION_I2C << 1) | I2C_MASTER_WRITE,
+                          true);
+    i2c_master_write_byte(handle_cmd, registro, true);
+
+    /* Fase lectura: Repeated START y cambiar a modo lectura */
+    i2c_master_start(handle_cmd);
+    i2c_master_write_byte(handle_cmd,
+                          (MLX90614_DIRECCION_I2C << 1) | I2C_MASTER_READ,
+                          true);
+    i2c_master_read(handle_cmd, buffer_rx, 3, I2C_MASTER_LAST_NACK);
+    i2c_master_stop(handle_cmd);
+
+    /* Ejecutar en I2C_NUM_1 */
+    esp_err_t resultado = i2c_master_cmd_begin(I2C_PUERTO_MLX90614, handle_cmd,
+                                               pdMS_TO_TICKS(I2C_TIMEOUT_MS));
+    i2c_cmd_link_delete(handle_cmd);
+
+    if (resultado != ESP_OK) {
+        ESP_LOGW(TAG_SISTEMA, "Error leyendo MLX90614 (reg=0x%02X): %s",
+                 registro, esp_err_to_name(resultado));
+        return resultado;
+    }
+
+    /* Combinar los dos bytes de dato (little-endian) */
+    uint16_t valor_raw = ((uint16_t)buffer_rx[1] << 8) | (uint16_t)buffer_rx[0];
+
+    /* El bit 15 en HIGH indica error en la medición */
+    if (valor_raw & 0x8000) {
+        ESP_LOGW(TAG_SISTEMA, "MLX90614: bit de error activo en registro 0x%02X", registro);
+        return ESP_FAIL;
+    }
+
+    /* Conversión a grados Celsius */
+    float temp_kelvin    = (float)valor_raw * 0.02f;
+    *temperatura_celsius = temp_kelvin - 273.15f;
+
+    return ESP_OK;
+}
+
+/* =========================================================================
+ * IMPLEMENTACIÓN: TAREA DE MONITOREO DE RITMO CARDÍACO (MAX30100)
+ * ========================================================================= */
+
+/**
+ * @brief Adquiere muestras del MAX30100 y calcula BPM y SpO2.
+ *
+ * Flujo completo:
+ *  1. Adquirir N muestras a ~100 Hz (N = 200 normal, 400 en alerta).
+ *  2. Calcular promedios IR y rojo (componente DC).
+ *  3. Verificar contacto (IR promedio > 10000 indica dedo presente).
+ *  4. Aplicar filtro pasa-bajos para suavizar ruido.
+ *  5. Eliminar componente DC para obtener señal AC pura (pulsaciones).
+ *  6. Detectar picos en señal AC y calcular BPM.
+ *  7. Calcular SpO2 con ratio de ratios (modelo didáctico).
+ *  8. Estimar calidad de señal (0–100).
+ *
+ * @param modo_alerta  Si true, se toman MUESTRAS_MAX30100_ALERTA (400) en lugar de 200
+ * @param resultado    Estructura de salida con BPM, SpO2 y metadatos
+ */
+void tarea_monitorear_ritmo(bool modo_alerta, ResultadoRitmo_t *resultado)
+{
+    int numero_muestras = modo_alerta ? MUESTRAS_MAX30100_ALERTA
+                                      : MUESTRAS_MAX30100_NORMAL;
+
+    printf("\n[RITMO] Iniciando monitoreo de ritmo cardíaco...\n");
+    printf("[RITMO] Modo: %s | Muestras: %d | Duración aprox: %d ms\n",
+           modo_alerta ? "ALERTA" : "NORMAL",
+           numero_muestras,
+           numero_muestras * DELAY_MUESTRAS_MAX30100_MS);
+    printf("[RITMO] Coloca el dedo sobre el sensor MAX30100...\n");
+
+    /*
+     * Buffer estático para las muestras crudas del sensor.
+     * Se usa static para evitar asignar 400 * 4 bytes = 1600 bytes en el stack.
+     */
+    static MuestraMax30100_t buffer_muestras_raw[MAX30100_BUFFER_SIZE];
+
+    /* Arreglos para procesamiento de señal */
+    static float senal_ir_raw[MAX30100_BUFFER_SIZE];
+    static float senal_red_raw[MAX30100_BUFFER_SIZE];
+    static float senal_ir_filtrada[MAX30100_BUFFER_SIZE];
+    static float senal_red_filtrada[MAX30100_BUFFER_SIZE];
+    static float senal_ir_ac[MAX30100_BUFFER_SIZE];
+    static float senal_red_ac[MAX30100_BUFFER_SIZE];
+
+    /* --- FASE 1: Adquisición de muestras --- */
+    int muestras_leidas = 0;
+    for (int i = 0; i < numero_muestras; i++) {
+        if (max30100_leer_muestra(&buffer_muestras_raw[i]) == ESP_OK) {
+            muestras_leidas++;
+        } else {
+            /* Si falla la lectura, rellenar con cero para no romper el buffer */
+            buffer_muestras_raw[i].ir  = 0;
+            buffer_muestras_raw[i].red = 0;
+        }
+        vTaskDelay(pdMS_TO_TICKS(DELAY_MUESTRAS_MAX30100_MS));
+    }
+
+    /* Validar mínimo de muestras para el cálculo */
+    if (muestras_leidas < 20) {
+        printf("[RITMO] Error: pocas muestras válidas (%d). Verificar sensor.\n",
+               muestras_leidas);
+        resultado->bpm_calculado      = -1;
+        resultado->spo2_estimada      = -1.0f;
+        resultado->contacto_detectado = false;
+        resultado->resultado_valido   = false;
+        resultado->calidad_senal      = 0;
+        strcpy(resultado->estado_texto, "Error de lectura I2C");
+        return;
+    }
+
+    /* --- FASE 2: Convertir a float y calcular promedios DC --- */
+    double suma_ir  = 0.0;
+    double suma_red = 0.0;
+
+    for (int i = 0; i < numero_muestras; i++) {
+        senal_ir_raw[i]  = (float)buffer_muestras_raw[i].ir;
+        senal_red_raw[i] = (float)buffer_muestras_raw[i].red;
+        suma_ir  += buffer_muestras_raw[i].ir;
+        suma_red += buffer_muestras_raw[i].red;
+    }
+
+    resultado->ir_promedio = (float)(suma_ir  / numero_muestras);
+    float red_promedio     = (float)(suma_red / numero_muestras);
+
+    /* --- FASE 3: Verificar contacto --- */
+    resultado->contacto_detectado = (resultado->ir_promedio > 10000.0f);
+
+    if (!resultado->contacto_detectado) {
+        printf("[RITMO] Sin contacto estable. IR promedio: %.0f (necesita >10000)\n",
+               resultado->ir_promedio);
+        resultado->bpm_calculado    = -1;
+        resultado->spo2_estimada    = -1.0f;
+        resultado->resultado_valido = false;
+        resultado->calidad_senal    = 0;
+        strcpy(resultado->estado_texto, "Sin contacto: coloca el dedo sobre el sensor");
+        return;
+    }
+
+    /* --- FASE 4: Filtro pasa-bajos para reducir ruido de alta frecuencia --- */
+    filtro_pasabajos_iir(senal_ir_raw,  senal_ir_filtrada,  numero_muestras, 0.85f);
+    filtro_pasabajos_iir(senal_red_raw, senal_red_filtrada, numero_muestras, 0.85f);
+
+    /* --- FASE 5: Eliminar componente DC para obtener señal AC --- */
+    eliminar_componente_dc(senal_ir_filtrada,  senal_ir_ac,  numero_muestras, 0.95f);
+    eliminar_componente_dc(senal_red_filtrada, senal_red_ac, numero_muestras, 0.95f);
+
+    /* Calcular RMS de la componente AC (amplitud de la pulsación) */
+    float ir_ac_rms  = calcular_rms(senal_ir_ac,  numero_muestras);
+    float red_ac_rms = calcular_rms(senal_red_ac, numero_muestras);
+
+    /* Calcular amplitud pico a pico del canal IR */
+    float ir_max = senal_ir_ac[0], ir_min = senal_ir_ac[0];
+    for (int i = 1; i < numero_muestras; i++) {
+        if (senal_ir_ac[i] > ir_max) ir_max = senal_ir_ac[i];
+        if (senal_ir_ac[i] < ir_min) ir_min = senal_ir_ac[i];
+    }
+    float ir_pico_a_pico = ir_max - ir_min;
+
+    /* --- FASE 6: Estimación de calidad de señal --- */
+    resultado->calidad_senal = estimar_calidad_senal_max30100(
+        resultado->ir_promedio, ir_ac_rms,
+        red_promedio, red_ac_rms,
+        ir_pico_a_pico
+    );
+
+    if (resultado->calidad_senal < 35) {
+        printf("[RITMO] Señal muy débil. Calidad: %d/100. Reposicionar dedo.\n",
+               resultado->calidad_senal);
+        resultado->bpm_calculado    = -1;
+        resultado->spo2_estimada    = -1.0f;
+        resultado->resultado_valido = false;
+        strcpy(resultado->estado_texto, "Señal débil: reposicionar dedo");
+        return;
+    }
+
+    /* --- FASE 7: Detección de picos y cálculo de BPM --- */
+    int bpm_detectado = detectar_picos_y_calcular_bpm(
+        senal_ir_ac, numero_muestras, (float)MAX30100_SAMPLE_RATE_HZ
+    );
+    resultado->bpm_calculado = bpm_detectado;
+
+    /* --- FASE 8: Estimación de SpO2 (ratio de ratios AC/DC) ---
+     *
+     * Fórmula del método ratio of ratios:
+     *   R = (AC_red / DC_red) / (AC_ir / DC_ir)
+     *   SpO2 ≈ 110 - 25 * R   (modelo empírico simplificado, no clínico)
+     *
+     * Un R≈0.5 corresponde a ~97.5% SpO2.
+     * Un R≈1.0 corresponde a ~85% SpO2.
+     */
+    resultado->spo2_estimada = -1.0f;
+    if (resultado->ir_promedio > 1.0f && red_promedio > 1.0f &&
+        ir_ac_rms > 5.0f && red_ac_rms > 5.0f) {
+
+        float ratio_r = (red_ac_rms / red_promedio) /
+                        (ir_ac_rms  / resultado->ir_promedio);
+
+        float spo2_calculada = 110.0f - 25.0f * ratio_r;
+
+        /* Limitar a rango fisiológico */
+        if (spo2_calculada > 100.0f) spo2_calculada = 100.0f;
+        if (spo2_calculada < 80.0f)  spo2_calculada = 80.0f;
+
+        resultado->spo2_estimada = spo2_calculada;
+    }
+
+    /* --- Determinar validez del resultado final --- */
+    if (resultado->bpm_calculado < 0) {
+        resultado->resultado_valido = false;
+        strcpy(resultado->estado_texto, "Pulso inestable: mantener quieto el dedo");
+    } else if (resultado->spo2_estimada < 0.0f) {
+        resultado->resultado_valido = false;
+        strcpy(resultado->estado_texto, "SpO2 inestable");
+    } else {
+        resultado->resultado_valido = true;
+        strcpy(resultado->estado_texto, "Lectura válida");
+    }
+
+    /* Imprimir resultados en serial */
+    printf("[RITMO] IR promedio: %.0f | Calidad señal: %d/100\n",
+           resultado->ir_promedio, resultado->calidad_senal);
+    printf("[RITMO] Contacto: %s | Estado: %s\n",
+           resultado->contacto_detectado ? "SÍ" : "NO",
+           resultado->estado_texto);
+
+    if (resultado->resultado_valido) {
+        printf("[RITMO] ✓ BPM: %d | SpO2: %.1f%%\n",
+               resultado->bpm_calculado, resultado->spo2_estimada);
+    } else {
+        printf("[RITMO] ✗ Resultado no válido en esta ventana\n");
+    }
+}
+
+/* =========================================================================
+ * IMPLEMENTACIÓN: TAREA DE MONITOREO DE TEMPERATURA (MLX90614)
+ * ========================================================================= */
+
+/**
+ * @brief Toma múltiples lecturas del MLX90614 y calcula el promedio.
+ *
+ * @param modo_alerta  Si true, usa MUESTRAS_TEMP_ALERTA (20) en lugar de 10
+ * @param resultado    Estructura de salida con temperatura promedio
+ */
+void tarea_monitorear_temperatura(bool modo_alerta, ResultadoTemperatura_t *resultado)
+{
+    uint32_t numero_muestras_temp = modo_alerta ? MUESTRAS_TEMP_ALERTA
+                                                : MUESTRAS_TEMP_NORMAL;
+
+    printf("\n[TEMP] Iniciando monitoreo de temperatura...\n");
+    printf("[TEMP] Modo: %s | Muestras: %lu\n",
+           modo_alerta ? "ALERTA" : "NORMAL", numero_muestras_temp);
+
+    double suma_temp_objeto   = 0.0;
+    double suma_temp_ambiente = 0.0;
+    uint32_t lecturas_exitosas = 0;
+
+    for (uint32_t i = 0; i < numero_muestras_temp; i++) {
+        float temp_objeto_actual   = 0.0f;
+        float temp_ambiente_actual = 0.0f;
+
+        esp_err_t res_obj = mlx90614_leer_temperatura(MLX90614_REG_TOBJ,
+                                                       &temp_objeto_actual);
+        esp_err_t res_amb = mlx90614_leer_temperatura(MLX90614_REG_TAMB,
+                                                       &temp_ambiente_actual);
+
+        if (res_obj == ESP_OK && res_amb == ESP_OK) {
+            suma_temp_objeto   += temp_objeto_actual;
+            suma_temp_ambiente += temp_ambiente_actual;
+            lecturas_exitosas++;
+            printf("[TEMP] Muestra %lu: Objeto=%.2f°C | Ambiente=%.2f°C\n",
+                   i + 1, temp_objeto_actual, temp_ambiente_actual);
+        } else {
+            printf("[TEMP] Muestra %lu: Error I2C en MLX90614\n", i + 1);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(DELAY_MUESTRAS_TEMP_MS));
+    }
+
+    if (lecturas_exitosas > 0) {
+        resultado->temp_objeto_celsius   = (float)(suma_temp_objeto   / lecturas_exitosas);
+        resultado->temp_ambiente_celsius = (float)(suma_temp_ambiente / lecturas_exitosas);
+    } else {
+        resultado->temp_objeto_celsius   = 0.0f;
+        resultado->temp_ambiente_celsius = 0.0f;
+        printf("[TEMP] ADVERTENCIA: ninguna lectura exitosa del MLX90614.\n");
+    }
+
+    resultado->total_muestras = numero_muestras_temp;
+    resultado->alerta_activa  = false;
+
+    printf("[TEMP] Promedio: Objeto=%.2f°C | Ambiente=%.2f°C | Válidas: %lu/%lu\n",
+           resultado->temp_objeto_celsius,
+           resultado->temp_ambiente_celsius,
+           lecturas_exitosas,
+           numero_muestras_temp);
+}
+
+/* =========================================================================
+ * IMPLEMENTACIÓN: LÓGICA DE ALERTAS
+ * ========================================================================= */
+
+/**
+ * @brief Evalúa si el BPM está fuera del rango [55–75] y activa ALERTA ROJA.
+ *
+ * Solo se evalúa si el resultado del MAX30100 es válido. Si el sensor no
+ * detectó contacto o la señal fue débil, no se genera alerta (sería un falso positivo).
+ */
+bool evaluar_alerta_roja(const ResultadoRitmo_t *resultado, ContextoSistema_t *ctx)
+{
+    /* No generar alerta si el resultado no es confiable */
+    if (!resultado->resultado_valido) {
+        printf("[ALERTA] Resultado de ritmo no válido. No se evalúa alerta roja.\n");
+        return false;
+    }
+
+    bool fuera_de_rango = (resultado->bpm_calculado < UMBRAL_BPM_MINIMO ||
+                           resultado->bpm_calculado > UMBRAL_BPM_MAXIMO);
+
+    if (fuera_de_rango) {
+        ctx->contador_alertas_rojas++;
+
+        printf("\n");
+        printf("==========================================\n");
+        printf("          ***  ALERTA ROJA  ***          \n");
+        printf("==========================================\n");
+        printf("  BPM medido   : %d lpm\n", resultado->bpm_calculado);
+        printf("  Rango normal : %d – %d lpm\n", UMBRAL_BPM_MINIMO, UMBRAL_BPM_MAXIMO);
+        printf("  SpO2 estimada: %.1f%%\n", resultado->spo2_estimada);
+        printf("  Alertas rojas acumuladas: %lu\n", ctx->contador_alertas_rojas);
+        printf("==========================================\n\n");
+        return true;
+    }
+
+    printf("[RITMO] BPM en rango normal (%d lpm). SpO2: %.1f%%\n",
+           resultado->bpm_calculado, resultado->spo2_estimada);
+    return false;
+}
+
+/**
+ * @brief Evalúa si la temperatura supera 36°C y activa ALERTA AMARILLA.
+ */
+bool evaluar_alerta_amarilla(const ResultadoTemperatura_t *resultado,
+                              ContextoSistema_t *ctx)
+{
+    bool temperatura_elevada = (resultado->temp_objeto_celsius > UMBRAL_TEMP_ALERTA_CELSIUS);
+
+    if (temperatura_elevada) {
+        ctx->contador_alertas_amarillas++;
+
+        printf("\n");
+        printf("==========================================\n");
+        printf("        ***  ALERTA AMARILLA  ***        \n");
+        printf("==========================================\n");
+        printf("  Temperatura  : %.2f°C\n", resultado->temp_objeto_celsius);
+        printf("  Umbral       : %.1f°C\n", UMBRAL_TEMP_ALERTA_CELSIUS);
+        printf("  Alertas amarillas acumuladas: %lu\n", ctx->contador_alertas_amarillas);
+        printf("==========================================\n\n");
+        return true;
+    }
+
+    printf("[TEMP] Temperatura normal (%.2f°C)\n", resultado->temp_objeto_celsius);
+    return false;
+}
+
+/**
+ * @brief Verifica si los contadores de alerta indican posible crisis de ansiedad.
+ * Condición: ≥5 alertas amarillas OR ≥3 alertas rojas acumuladas en la sesión.
+ */
+bool verificar_posible_crisis(const ContextoSistema_t *ctx)
+{
+    bool crisis_temperatura = (ctx->contador_alertas_amarillas >= MAX_ALERTAS_AMARILLAS);
+    bool crisis_ritmo       = (ctx->contador_alertas_rojas     >= MAX_ALERTAS_ROJAS);
+
+    if (crisis_temperatura || crisis_ritmo) {
+        printf("\n");
+        printf("##########################################\n");
+        printf("#                                        #\n");
+        printf("#  *** POSIBLE CRISIS DE ANSIEDAD ***    #\n");
+        printf("#                                        #\n");
+        printf("##########################################\n");
+        printf("  Alertas amarillas : %lu / %d\n",
+               ctx->contador_alertas_amarillas, MAX_ALERTAS_AMARILLAS);
+        printf("  Alertas rojas     : %lu / %d\n",
+               ctx->contador_alertas_rojas, MAX_ALERTAS_ROJAS);
+        printf("  Por favor, atienda al paciente.\n");
+        printf("##########################################\n\n");
+        return true;
+    }
+
+    return false;
+}

@@ -1,0 +1,89 @@
+#include <ACS712.h>
+
+#define PIN_CORRIENTE 34
+#define PIN_VOLTAGE   35
+
+// ACS712 alimentado a 5V, pero leído por un ESP32 (4095 pasos)
+ACS712 sensor(PIN_CORRIENTE, 5.0, 4095, 100); 
+
+// --- Configuración de Calibración ---
+// Ajusta este factor hasta que el "V. Filt" coincida con tu multímetro
+const float CALIBRATION_FACTOR = 1.34; 
+
+const float V_MAX = 4.2;   // 100% de la Li-ion
+const float V_MIN = 3.2;   // 0% de seguridad
+
+// --- Variables para el Filtro Estabilizador ---
+float voltajeFiltrado = 4.0; // Iniciamos en un valor cercano al real
+float corrienteFiltrada = 0.0;
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Configuración del ADC del ESP32
+  analogReadResolution(12); 
+  
+  Serial.println("Calibrando sensores (No debe haber carga conectada)...");
+  delay(2000);
+  sensor.autoMidPoint(); // Calibra el cero del ACS712
+  
+  // Lectura inicial para que el filtro no empiece desde cero
+  int adcInicial = analogRead(PIN_VOLTAGE);
+  voltajeFiltrado = (adcInicial / 4095.0) * 3.3 * 2.0 * CALIBRATION_FACTOR;
+  
+  Serial.println("Sistema Listo y Estabilizado");
+}
+
+void loop() {
+  // ==========================================
+  // 1. LECTURA Y FILTRADO DE VOLTAJE
+  // ==========================================
+  long sumaADC = 0;
+  int muestras = 100;
+
+  for(int i = 0; i < muestras; i++) {
+    sumaADC += analogRead(PIN_VOLTAGE);
+    delayMicroseconds(500); // Muestreo rápido
+  }
+  
+  float adcPromedio = (float)sumaADC / muestras;
+  float voltajeInstante = (adcPromedio / 4095.0) * 3.3 * 2.0 * CALIBRATION_FACTOR;
+
+  // APLICACIÓN DEL FILTRO (0.95 peso al pasado, 0.05 al presente)
+  voltajeFiltrado = (voltajeFiltrado * 0.95) + (voltajeInstante * 0.05);
+
+  // ==========================================
+  // 2. LECTURA Y FILTRADO DE CORRIENTE
+  // ==========================================
+  float sumaI = 0;
+  for (int i = 0; i < muestras; i++) {
+    sumaI += sensor.mA_DC();
+  }
+  float corrienteInstante = (sumaI / muestras) / 1000.0; // Convertir a Amperios
+
+  // También filtramos la corriente para evitar saltos por ruido magnético
+  corrienteFiltrada = (corrienteFiltrada * 0.9) + (corrienteInstante * 0.1);
+
+  // ==========================================
+  // 3. CÁLCULO DE PORCENTAJE
+  // ==========================================
+  float porcentaje = (voltajeFiltrado - V_MIN) / (V_MAX - V_MIN) * 100.0;
+  porcentaje = constrain(porcentaje, 0, 100);
+
+  // ==========================================
+  // 4. SALIDA DE DATOS
+  // ==========================================
+  Serial.print("V. Filt: ");
+  Serial.print(voltajeFiltrado, 3);
+  Serial.print(" V | ");
+
+  Serial.print("I. Filt: ");
+  Serial.print(corrienteFiltrada, 3);
+  Serial.print(" A | ");
+
+  Serial.print("Bateria: ");
+  Serial.print((int)porcentaje);
+  Serial.println(" %");
+
+  delay(1000); // Reporte cada segundo
+}

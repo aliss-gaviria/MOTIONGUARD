@@ -1,0 +1,98 @@
+#include <Arduino.h>
+#define PULSE_PIN 34
+#define LED_PIN 13
+
+float alpha = 0.2;
+int threshold = 2090;
+int hysteresis = 50;
+
+unsigned long noBeatTimeout = 3500;
+
+float filtered = 0;
+bool lastState = false;
+
+unsigned long lastBeat = 0;
+float bpm = 0;
+
+const int RATE_SIZE = 16;
+float rates[RATE_SIZE];
+int rateSpot = 0;
+float bpmAvg = 0;
+
+unsigned long lastPrint = 0;
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PULSE_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);
+
+  for (int i = 0; i < RATE_SIZE; i++) {
+    rates[i] = 0;
+  }
+}
+
+void loop() {
+  int raw = analogRead(PULSE_PIN);
+
+  filtered = alpha * raw + (1 - alpha) * filtered;
+
+  int upperThreshold = threshold;
+  int lowerThreshold = threshold - hysteresis;
+
+  bool currentState;
+
+  if (filtered > upperThreshold) {
+    currentState = true;
+  } else if (filtered < lowerThreshold) {
+    currentState = false;
+  } else {
+    currentState = lastState;
+  }
+
+  if (currentState && !lastState && (millis() - lastBeat > 300)) {
+    unsigned long delta = millis() - lastBeat;
+    lastBeat = millis();
+
+    bpm = 60.0 / (delta / 1000.0);
+
+    if (bpm > 40 && bpm < 200) {
+      rates[rateSpot++] = bpm;
+      rateSpot %= RATE_SIZE;
+
+      bpmAvg = 0;
+      int count = 0;
+
+      for (int i = 0; i < RATE_SIZE; i++) {
+        if (rates[i] > 0) {
+          bpmAvg += rates[i];
+          count++;
+        }
+      }
+
+      if (count > 0) bpmAvg /= count;
+    }
+  }
+
+  lastState = currentState;
+
+  if (millis() - lastBeat > noBeatTimeout) {
+    bpm = 0;
+    bpmAvg = 0;
+  }
+
+  digitalWrite(LED_PIN, currentState);
+
+  if (millis() - lastPrint > 2000) {
+    if (bpm == 0) {
+      Serial.println("No hay dedo");
+    } else {
+      Serial.println("------ BPM ------");
+      Serial.print("BPM: ");
+      Serial.println(bpmAvg);
+      Serial.println("-----------------");
+    }
+    lastPrint = millis();
+  }
+
+  delay(10);
+}

@@ -1,0 +1,25 @@
+var max30100_8c =
+[
+    [ "MAX30100_LED_CURR_27MA", "max30100_8c.html#a494093b968552435ae1fac21a12d13ea", null ],
+    [ "MAX30100_LED_PW_1600US", "max30100_8c.html#a382b9610ac9051c0ff71979af8456697", null ],
+    [ "MAX30100_MAX_PICOS", "max30100_8c.html#a89dff3b941761b0375d7ca44edfdc91f", null ],
+    [ "MAX30100_MIN_MUESTRAS_VALIDAS", "max30100_8c.html#a2f7e4602c16fc171e33517461f271419", null ],
+    [ "MAX30100_MODE_SPO2", "max30100_8c.html#ad246b1288cc10700a8d33f444bb7a7a3", null ],
+    [ "MAX30100_REG_FIFO_DATA", "max30100_8c.html#af2ccc79481641ba1b6d97ac83535f9f4", null ],
+    [ "MAX30100_REG_FIFO_RD_PTR", "max30100_8c.html#af561fe26af53cc50fd52032d9fd23d33", null ],
+    [ "MAX30100_REG_FIFO_WR_PTR", "max30100_8c.html#a0581365fb60b7e311cdab5cec2c79bc2", null ],
+    [ "MAX30100_REG_INT_ENABLE", "max30100_8c.html#a68025e10d0acc8eb06e7ff4a81e3ffd0", null ],
+    [ "MAX30100_REG_INT_STATUS", "max30100_8c.html#a48712163c2bcf93a7b1948bdb352a31a", null ],
+    [ "MAX30100_REG_LED_CONFIG", "max30100_8c.html#a77afb79097e2b63aea31b611871aa0dc", null ],
+    [ "MAX30100_REG_MODE_CONFIG", "max30100_8c.html#acf1786a356796b1cc30c877f5784e1da", null ],
+    [ "MAX30100_REG_OVF_COUNTER", "max30100_8c.html#a96fcb49cecb92b7d734322fb1aebca62", null ],
+    [ "MAX30100_REG_PART_ID", "max30100_8c.html#a2978974a8916167f5e74c72b7fbf84a1", null ],
+    [ "MAX30100_REG_SPO2_CONFIG", "max30100_8c.html#a6c11adf6d323565054e38a8b69321c74", null ],
+    [ "MAX30100_RESET_BIT", "max30100_8c.html#a2dab98bf990c63a91eedc6f2794e4090", null ],
+    [ "MAX30100_SPO2_HI_RES_EN", "max30100_8c.html#a8663cc2c0ee6cdf6585242ecd2f80046", null ],
+    [ "MAX30100_SR_100HZ", "max30100_8c.html#a24f49b50093e43b2d93b7545eb5b5ab8", null ],
+    [ "i2c_inicializar_max30100", "max30100_8c.html#a6cf42eb638ad75ad4a3dcb2c6b569a90", null ],
+    [ "max30100_inicializar", "max30100_8c.html#a5baa544e0640ce4a6490da5969cd68e9", null ],
+    [ "max30100_leer_muestra", "max30100_8c.html#af401defd08cb8e6e7f5e9f58ee459c67", null ],
+    [ "tarea_monitorear_ritmo", "max30100_8c.html#a7a52bc7496fd47eee5a165fb5cb2b345", null ]
+];

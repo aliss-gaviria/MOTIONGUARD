@@ -1,0 +1,89 @@
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+
+MAX30105 particleSensor;
+
+const byte RATE_SIZE = 16; // Reducido de 16 a 4 para promediar menos muestras y actualizar más rápido 
+byte rates[RATE_SIZE]; 
+byte rateSpot = 0;
+long lastBeat = 0; 
+
+float beatsPerMinute;
+int beatAvg;
+float filteredBPM = 0.0;
+const float alpha = 0.1; // Factor de suavizado: 0.1 = poco suavizado, 0.01 = muy suavizado
+
+
+unsigned long lastReportTime = 0;
+const unsigned long reportInterval = 2000; // Cambiado a 1000 ms (1 segundo) para reportes más frecuentes 
+
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Initializing...");
+
+  // Inicializar el buffer de rates con un valor típico de BPM (70) para evitar promedios bajos iniciales
+  for (byte x = 0; x < RATE_SIZE; x++) {
+    rates[x] = 70;
+  }
+
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30105 was not found. Please check wiring/power. ");
+    while (1);
+  }
+
+  particleSensor.setup(); 
+  particleSensor.setPulseAmplitudeRed(0x0A); 
+  particleSensor.setPulseAmplitudeGreen(0);
+  
+  lastReportTime = millis();
+}
+
+void loop() {
+  long irValue = particleSensor.getIR();
+
+  
+  if (checkForBeat(irValue) == true) {
+    long delta = millis() - lastBeat;
+    lastBeat = millis();
+
+    beatsPerMinute = 60 / (delta / 1000.0);
+
+    if (beatsPerMinute < 255 && beatsPerMinute > 20) {
+      rates[rateSpot++] = (byte)beatsPerMinute; 
+      rateSpot %= RATE_SIZE; 
+
+      beatAvg = 0;
+      for (byte x = 0 ; x < RATE_SIZE ; x++)
+        beatAvg += rates[x];
+      beatAvg/= RATE_SIZE;
+
+      // Aplicar filtro pasa-bajos (EMA) al BPM instantáneo
+      filteredBPM = alpha * beatsPerMinute + (1 - alpha) * filteredBPM;
+    }
+  }
+
+  
+  if (millis() - lastReportTime >= reportInterval) {
+    
+    Serial.println("\n--- REPORTE CADA 2.5 SEGUNDOS ---");
+    
+    if (irValue < 50000) {
+      Serial.println("Estado: No se detecta dedo");
+    } else {
+      Serial.print("BPM Instantáneo: ");
+      Serial.println(beatsPerMinute);
+      Serial.print("BPM Promedio (ventana de ");
+      Serial.print(RATE_SIZE);
+      Serial.print("): ");
+      Serial.println(beatAvg);
+      Serial.print("BPM Filtrado (EMA): ");
+      Serial.println(filteredBPM);
+    }
+    
+    Serial.println("-------------------------------");
+
+    lastReportTime = millis(); 
+  }
+}

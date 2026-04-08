@@ -1,0 +1,81 @@
+#include <Arduino.h> // Importante para que reconozca el framework
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/adc.h"
+
+// --- CONFIG ---
+#define ADC_CORRIENTE ADC1_CHANNEL_6  // GPIO34
+#define ADC_VOLTAJE   ADC1_CHANNEL_7  // GPIO35
+#define R1 10000.0
+#define R2 10000.0
+
+const float CALIBRACION_V = 1.13; 
+
+float capacidad_Ah = 6.0;     // 6000 mAh
+float voltaje_nominal = 3.7;  
+
+float energia_total_Wh;
+float energia_consumida_Wh = 0;
+
+// --- LEER CORRIENTE (ACS712 @ 5V) ---
+float leer_corriente() {
+    int adc = adc1_get_raw(ADC_CORRIENTE);
+    float Vadc = (adc / 4095.0) * 3.3;
+
+    // Lógica 5V: el cero está en 2.5V
+    float corriente = (Vadc - 2.5) / 0.1; 
+    return corriente;
+}
+
+// --- LEER VOLTAJE ---
+float leer_voltaje() {
+    int adc = adc1_get_raw(ADC_VOLTAJE);
+    float Vadc = (adc / 4095.0) * 3.3;
+
+    float Vreal = Vadc * ((R1 + R2) / R2) * CALIBRACION_V;
+    return Vreal;
+}
+
+// --- TAREA ---
+void tarea_bateria(void *pvParameters) {
+    energia_total_Wh = voltaje_nominal * capacidad_Ah;
+    const float dt_horas = 1.0 / 3600.0;
+
+    while (1) {
+        float corriente = leer_corriente();
+        float voltaje   = leer_voltaje();
+        float potencia  = voltaje * corriente; 
+
+        energia_consumida_Wh += potencia * dt_horas;
+        float porcentaje = 100.0 * (1.0 - (energia_consumida_Wh / energia_total_Wh));
+
+        if (porcentaje < 0) porcentaje = 0;
+        if (porcentaje > 100) porcentaje = 100;
+
+        printf("V: %.2f V | I: %.2f A | P: %.2f W | %%: %.2f\n",
+               voltaje, corriente, potencia, porcentaje);
+
+        vTaskDelay(pdMS_TO_TICKS(1000)); 
+    }
+}
+
+// --- ARDUINO SETUP (Reemplaza a app_main) ---
+void setup() {
+    // Inicializamos el puerto serie por si acaso
+    Serial.begin(115200);
+
+    // Configuración de ADC
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    adc1_config_channel_atten(ADC_CORRIENTE, ADC_ATTEN_DB_11);
+    adc1_config_channel_atten(ADC_VOLTAJE, ADC_ATTEN_DB_11);
+
+    // Creamos la tarea igual que antes
+    xTaskCreate(tarea_bateria, "bateria", 4096, NULL, 5, NULL);
+}
+
+// --- ARDUINO LOOP (Obligatorio aunque esté vacío) ---
+void loop() {
+    // No ponemos nada aquí porque todo ocurre en la tarea "tarea_bateria"
+    vTaskDelay(pdMS_TO_TICKS(10000)); 
+}

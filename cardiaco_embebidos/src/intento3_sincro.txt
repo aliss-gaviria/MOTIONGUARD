@@ -1,0 +1,241 @@
+#include <Arduino.h>
+#include "AsyncTaskLib.h"
+#include "StateMachineLib.h"
+#include "esp_sleep.h"
+
+#define PULSE_PIN 34
+#define LED_PIN 13
+
+QueueHandle_t bpmQueue;
+const int QUEUE_LEN = 10;
+
+float alpha = 0.2;
+int threshold = 2400;
+int hysteresis = 50;
+unsigned long noBeatTimeout = 3500;
+
+float filtered = 0;
+bool lastState = false;
+
+unsigned long lastBeat = 0;
+float bpm = 0;
+
+const int RATE_SIZE = 16;
+float rates[RATE_SIZE];
+int rateSpot = 0;
+float bpmAvg = 0;
+
+bool fingerDetected = false;
+bool stabilizationFinished = false;
+bool monitoringFinished = false;
+
+enum State {
+  INIT = 0,
+  STABILIZING,
+  MONITORING,
+  SLEEPING
+};
+
+StateMachine stateMachine(4, 5);
+State currentState;
+
+void readSensor();
+void reportData();
+void stabilizationDone();
+void monitoringDone();
+
+void setupStateMachine();
+void onInit();
+void onStabilizing();
+void onMonitoring();
+void onSleeping();
+
+AsyncTask TaskReadSensor(1, true, readSensor);
+AsyncTask TaskReport(2000, true, reportData);
+AsyncTask TaskStabilizationTimer(15000, false, stabilizationDone);
+AsyncTask TaskMonitoringTimer(30000, false, monitoringDone);
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PULSE_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);
+
+  bpmQueue = xQueueCreate(QUEUE_LEN, sizeof(float));
+
+  for (int i = 0; i < RATE_SIZE; i++) {
+    rates[i] = 0;
+  }
+
+  setupStateMachine();
+  stateMachine.SetState(INIT, false, true);
+}
+
+void loop() {
+  TaskReadSensor.Update();
+  TaskReport.Update();
+  TaskStabilizationTimer.Update();
+  TaskMonitoringTimer.Update();
+
+  stateMachine.Update();
+}
+
+void setupStateMachine() {
+
+  stateMachine.AddTransition(INIT, STABILIZING, []() {
+    return fingerDetected;
+  });
+
+  stateMachine.AddTransition(STABILIZING, INIT, []() {
+    return !fingerDetected;
+  });
+
+  stateMachine.AddTransition(STABILIZING, MONITORING, []() {
+    return stabilizationFinished;
+  });
+
+  stateMachine.AddTransition(MONITORING, INIT, []() {
+    return !fingerDetected;
+  });
+
+  stateMachine.AddTransition(MONITORING, SLEEPING, []() {
+    return monitoringFinished;
+  });
+
+  stateMachine.SetOnEntering(INIT, onInit);
+  stateMachine.SetOnEntering(STABILIZING, onStabilizing);
+  stateMachine.SetOnEntering(MONITORING, onMonitoring);
+  stateMachine.SetOnEntering(SLEEPING, onSleeping);
+}
+
+void onInit() {
+  Serial.println("\nEstado: INIT - Esperando dedo");
+
+  currentState = INIT;
+  stabilizationFinished = false;
+  monitoringFinished = false;
+
+  TaskReadSensor.Start();
+  TaskReport.Stop();
+  TaskStabilizationTimer.Stop();
+  TaskMonitoringTimer.Stop();
+}
+
+void onStabilizing() {
+  Serial.println("\nEstado: STABILIZING");
+
+  currentState = STABILIZING;
+
+  TaskReport.Stop();
+  TaskStabilizationTimer.Start();
+}
+
+void onMonitoring() {
+  Serial.println("\nEstado: MONITORING");
+
+  currentState = MONITORING;
+
+  xQueueReset(bpmQueue);
+
+  TaskReport.Start();
+  TaskMonitoringTimer.Start();
+}
+
+void onSleeping() {
+  Serial.println("\nEstado: SLEEPING");
+
+  TaskReadSensor.Stop();
+  TaskReport.Stop();
+
+  delay(100);
+
+  esp_sleep_enable_timer_wakeup(30 * 1000000);
+  esp_deep_sleep_start();
+}
+
+// ===== SENSOR =====
+void readSensor() {
+
+  int raw = analogRead(PULSE_PIN);
+
+  filtered = alpha * raw + (1 - alpha) * filtered;
+
+  int upperThreshold = threshold;
+  int lowerThreshold = threshold - hysteresis;
+
+  bool currentStateSignal;
+
+  if (filtered > upperThreshold) {
+    currentStateSignal = true;
+  } else if (filtered < lowerThreshold) {
+    currentStateSignal = false;
+  } else {
+    currentStateSignal = lastState;
+  }
+
+  if (currentStateSignal && !lastState && (millis() - lastBeat > 300)) {
+
+    unsigned long delta = millis() - lastBeat;
+    lastBeat = millis();
+
+    bpm = 60.0 / (delta / 1000.0);
+
+    if (bpm > 40 && bpm < 200) {
+
+      rates[rateSpot++] = bpm;
+      rateSpot %= RATE_SIZE;
+
+      bpmAvg = 0;
+      int count = 0;
+
+      for (int i = 0; i < RATE_SIZE; i++) {
+        if (rates[i] > 0) {
+          bpmAvg += rates[i];
+          count++;
+        }
+      }
+
+      if (count > 0) bpmAvg /= count;
+
+      if (currentState == MONITORING) {
+        xQueueSend(bpmQueue, &bpmAvg, 0);
+      }
+    }
+  }
+
+  lastState = currentStateSignal;
+
+  if (millis() - lastBeat > noBeatTimeout) {
+    bpm = 0;
+    bpmAvg = 0;
+  }
+
+  // 🔥 DETECCIÓN DE DEDO SOLO POR BPM
+  fingerDetected = (bpm > 0);
+
+  digitalWrite(LED_PIN, currentStateSignal);
+}
+
+// ===== REPORTE =====
+void reportData() {
+
+  float data;
+
+  if (!fingerDetected) {
+    Serial.println("No hay dedo");
+    return;
+  }
+
+  while (xQueueReceive(bpmQueue, &data, 0) == pdTRUE) {
+    Serial.print("BPM: ");
+    Serial.println(data);
+  }
+}
+
+void stabilizationDone() {
+  stabilizationFinished = true;
+}
+
+void monitoringDone() {
+  monitoringFinished = true;
+}
