@@ -1,0 +1,28 @@
+var config_8c =
+[
+    [ "alpha", "config_8c.html#ab1551d8043c2aa4410fb7dbb1fe3be7b", null ],
+    [ "bpm", "config_8c.html#ab0560092cbaa233e74bb0d543a85965d", null ],
+    [ "bpmAvg", "config_8c.html#adfb861013db12e5325bf0655c9c26edd", null ],
+    [ "bpmQueue", "config_8c.html#af40af793bad23f8589e1ad9098062562", null ],
+    [ "CALIBRACION_V", "config_8c.html#a37debbe1aaddc5e0b8e7da95b6bccfbe", null ],
+    [ "contadorMuestras", "config_8c.html#aa97a2388f3be6a12248d65f70bcecf02", null ],
+    [ "currentState", "config_8c.html#a62d920a9a06d7ac5b8c98e175defd014", null ],
+    [ "filtered", "config_8c.html#af2eed96d0424911b730d85f8304c47a2", null ],
+    [ "fingerDetected", "config_8c.html#a4e4640b4590fc4dc22decba5ecd9dd25", null ],
+    [ "hysteresis", "config_8c.html#a4257cae2890c89c3731319abb2fc3793", null ],
+    [ "lastBeat", "config_8c.html#a6f23718df566aced02d65fd0e6089d34", null ],
+    [ "lastState", "config_8c.html#a4ec0de3047725b2b432e393606c8e1a3", null ],
+    [ "monitoringFinished", "config_8c.html#a56574a6ddee284f4faa2a30bf2cf6334", null ],
+    [ "numMuestras", "config_8c.html#a4241d558b9f9889b83947b4151b53199", null ],
+    [ "porcentajeBateria", "config_8c.html#ad84e380a76f84dba52b467da418d3086", null ],
+    [ "rates", "config_8c.html#a380e5eed141d8312fab7c803c7bdc047", null ],
+    [ "rateSpot", "config_8c.html#a3762baef236e1d695c7b3fd147e1bc79", null ],
+    [ "receiverMac", "config_8c.html#aad817413e6bc60b8bba4f54cfef19a50", null ],
+    [ "stabilizationFinished", "config_8c.html#ad0c2040c812dc0316b494a456e369306", null ],
+    [ "stateStartTime", "config_8c.html#a8de797a3e5da6b63832e8997337ad507", null ],
+    [ "sumaVoltaje", "config_8c.html#a0c5df70f141f91e71a3f41d67167049e", null ],
+    [ "threshold", "config_8c.html#a686599473d8ce395e95619896d88d539", null ],
+    [ "VMAX", "config_8c.html#a6aacac85bde06969e36057b0b708291e", null ],
+    [ "VMIN", "config_8c.html#adf0f19d2a1047eae93e6772a483fb669", null ],
+    [ "voltajePromedio", "config_8c.html#aca79a2efa9ac63daac29ae4e05c67257", null ]
+];

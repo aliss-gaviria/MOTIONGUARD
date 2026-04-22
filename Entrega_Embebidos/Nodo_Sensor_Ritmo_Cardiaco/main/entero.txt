@@ -1,0 +1,323 @@
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+
+#include "driver/gpio.h"
+#include "esp_adc/adc_oneshot.h"
+
+#include "esp_wifi.h"
+#include "esp_now.h"
+#include "esp_sleep.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+
+#include "cJSON.h"
+
+// ---------------- PINES ----------------
+#define PULSE_PIN GPIO_NUM_34
+#define LED_PIN   GPIO_NUM_13
+
+// ---------------- ADC ----------------
+#define ADC_CANAL ADC_CHANNEL_7
+#define R1 10000.0
+#define R2 10000.0
+
+const float CALIBRACION_V = 1.04;
+const float VMAX = 4.2;
+const float VMIN = 3.0;
+
+// ---------------- VARIABLES BATERÍA ----------------
+float voltajePromedio = 0;
+float porcentajeBateria = 0;
+float sumaVoltaje = 0;
+int contadorMuestras = 0;
+const int numMuestras = 25;
+
+// ---------------- BPM ----------------
+float alpha = 0.2;
+int threshold = 2400;
+int hysteresis = 50;
+
+float filtered = 0;
+bool lastState = false;
+
+unsigned long lastBeat = 0;
+float bpm = 0;
+
+#define RATE_SIZE 16
+float rates[RATE_SIZE];
+int rateSpot = 0;
+float bpmAvg = 0;
+
+bool fingerDetected = false;
+
+// ---------------- COLA ----------------
+QueueHandle_t bpmQueue;
+
+// ---------------- ESTADOS ----------------
+typedef enum {
+    INIT,
+    STABILIZING,
+    MONITORING,
+    SLEEPING
+} State;
+
+State currentState = INIT;
+
+bool stabilizationFinished = false;
+bool monitoringFinished = false;
+
+// ---------------- ESP-NOW ----------------
+uint8_t receiverMac[] = {0xB4, 0x3A, 0x45, 0x29, 0xA0, 0x78};
+
+// ---------------- ADC HANDLE ----------------
+adc_oneshot_unit_handle_t adc_handle;
+
+// ---------------- TIEMPOS ----------------
+#define STABILIZATION_TIME 15000
+#define MONITORING_TIME    10000
+
+int64_t stateStartTime = 0;
+
+// ---------------- INIT ADC ----------------
+void init_adc() {
+    adc_oneshot_unit_init_cfg_t init_config = {
+        .unit_id = ADC_UNIT_1,
+    };
+    adc_oneshot_new_unit(&init_config, &adc_handle);
+
+    adc_oneshot_chan_cfg_t config = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .atten = ADC_ATTEN_DB_12,
+    };
+    adc_oneshot_config_channel(adc_handle, ADC_CANAL, &config);
+}
+
+// ---------------- VOLTAJE ----------------
+float leer_voltaje() {
+    int adc_raw;
+    adc_oneshot_read(adc_handle, ADC_CANAL, &adc_raw);
+
+    float Vadc = (adc_raw / 4095.0) * 3.3;
+    float Vreal = Vadc * ((R1 + R2) / R2) * CALIBRACION_V;
+
+    return Vreal;
+}
+
+float calcular_porcentaje(float voltaje) {
+    float p = (voltaje - VMIN) / (VMAX - VMIN) * 100.0;
+    if (p > 100) p = 100;
+    if (p < 0) p = 0;
+    return p;
+}
+
+// ---------------- ESP-NOW ----------------
+void init_esp_now() {
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_start();
+
+    esp_now_init();
+
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, receiverMac, 6);
+    peer.ifidx = WIFI_IF_STA;
+    peer.channel = 0;
+    peer.encrypt = false;
+
+    esp_now_add_peer(&peer);
+}
+
+// ---------------- ENVÍO ----------------
+void sendData(float bpmValue) {
+
+    cJSON *doc = cJSON_CreateObject();
+
+    cJSON_AddStringToObject(doc, "id", "1");
+    cJSON_AddNumberToObject(doc, "BPM", bpmValue);
+    cJSON_AddNumberToObject(doc, "voltaje", voltajePromedio);
+    cJSON_AddNumberToObject(doc, "bateria", porcentajeBateria);
+
+    char *buffer = cJSON_PrintUnformatted(doc);
+
+    esp_now_send(receiverMac, (uint8_t *)buffer, strlen(buffer));
+
+    cJSON_Delete(doc);
+    free(buffer);
+}
+
+// ---------------- SENSOR TASK ----------------
+void task_sensor(void *pv) {
+
+    while (1) {
+        int adc_raw;
+        adc_oneshot_read(adc_handle, ADC_CANAL, &adc_raw);
+
+        filtered = alpha * adc_raw + (1 - alpha) * filtered;
+
+        int upper = threshold;
+        int lower = threshold - hysteresis;
+
+        bool current;
+
+        if (filtered > upper) current = true;
+        else if (filtered < lower) current = false;
+        else current = lastState;
+
+        if (current && !lastState && (esp_timer_get_time()/1000 - lastBeat > 300)) {
+
+            unsigned long now = esp_timer_get_time()/1000;
+            unsigned long delta = now - lastBeat;
+            lastBeat = now;
+
+            bpm = 60.0 / (delta / 1000.0);
+
+            if (bpm > 40 && bpm < 200) {
+
+                rates[rateSpot++] = bpm;
+                rateSpot %= RATE_SIZE;
+
+                bpmAvg = 0;
+                int count = 0;
+
+                for (int i = 0; i < RATE_SIZE; i++) {
+                    if (rates[i] > 0) {
+                        bpmAvg += rates[i];
+                        count++;
+                    }
+                }
+
+                if (count > 0) bpmAvg /= count;
+
+                if (currentState == MONITORING) {
+                    xQueueSend(bpmQueue, &bpmAvg, 0);
+                }
+            }
+        }
+
+        lastState = current;
+
+        fingerDetected = (bpm > 0);
+
+        gpio_set_level(LED_PIN, current);
+
+        // batería
+        if (currentState == MONITORING) {
+            sumaVoltaje += leer_voltaje();
+            contadorMuestras++;
+
+            if (contadorMuestras >= numMuestras) {
+                voltajePromedio = sumaVoltaje / numMuestras;
+                porcentajeBateria = calcular_porcentaje(voltajePromedio);
+
+                sumaVoltaje = 0;
+                contadorMuestras = 0;
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+
+// ---------------- REPORT TASK ----------------
+void task_report(void *pv) {
+
+    float data;
+
+    while (1) {
+
+        if (!fingerDetected) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        while (xQueueReceive(bpmQueue, &data, 0) == pdTRUE) {
+            printf("BPM: %.2f\n", data);
+            sendData(data);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
+// ---------------- STATE MACHINE ----------------
+void state_machine_task(void *pv) {
+
+    while (1) {
+
+        int64_t now = esp_timer_get_time() / 1000;
+
+        switch (currentState) {
+
+            case INIT:
+                if (fingerDetected) {
+                    currentState = STABILIZING;
+                    stateStartTime = now;
+                    printf("STABILIZING\n");
+                }
+                break;
+
+            case STABILIZING:
+                if (!fingerDetected) {
+                    currentState = INIT;
+                } else if (now - stateStartTime > STABILIZATION_TIME) {
+                    currentState = MONITORING;
+                    stateStartTime = now;
+
+                    xQueueReset(bpmQueue);
+                    sumaVoltaje = 0;
+                    contadorMuestras = 0;
+
+                    printf("MONITORING\n");
+                }
+                break;
+
+            case MONITORING:
+                if (!fingerDetected) {
+                    currentState = INIT;
+                } else if (now - stateStartTime > MONITORING_TIME) {
+                    currentState = SLEEPING;
+                    printf("SLEEPING\n");
+                }
+                break;
+
+            case SLEEPING:
+                sendData(bpmAvg);
+                vTaskDelay(pdMS_TO_TICKS(200));
+
+                esp_sleep_enable_timer_wakeup(30 * 1000000);
+                esp_deep_sleep_start();
+                break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+// ---------------- MAIN ----------------
+void app_main() {
+
+    nvs_flash_init();
+
+    gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
+
+    init_adc();
+    init_esp_now();
+
+    bpmQueue = xQueueCreate(10, sizeof(float));
+
+    xTaskCreate(task_sensor, "sensor", 4096, NULL, 5, NULL);
+    xTaskCreate(task_report, "report", 4096, NULL, 5, NULL);
+    xTaskCreate(state_machine_task, "fsm", 4096, NULL, 5, NULL);
+
+    printf("Sistema iniciado\n");
+}
